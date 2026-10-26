@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -7,6 +8,29 @@ from PySide6.QtCore import QThread, Signal
 
 PLATFORM_YOUTUBE = "youtube"
 PLATFORM_INSTAGRAM = "instagram"
+
+FFMPEG_INSTALL_HELP = (
+    "FFmpeg не найден. Обычно он устанавливается автоматически вместе с зависимостями проекта. "
+    "В активированном виртуальном окружении выполните: "
+    "python -m pip install -U imageio-ffmpeg yt-dlp. "
+    "Альтернатива для Windows: winget install --id Gyan.FFmpeg -e, "
+    "затем полностью перезапустите терминал и приложение."
+)
+
+def find_ffmpeg():
+    """Find a system FFmpeg or the executable supplied by imageio-ffmpeg."""
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return str(Path(system_ffmpeg).resolve())
+
+    try:
+        import imageio_ffmpeg
+        bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled_ffmpeg and Path(bundled_ffmpeg).is_file():
+            return str(Path(bundled_ffmpeg).resolve())
+    except (ImportError, OSError, RuntimeError):
+        pass
+    return None
 
 def detect_platform(url: str):
     host = (urlparse(url).hostname or "").lower()
@@ -60,6 +84,13 @@ class DownloadWorker(QThread):
             self.finished_task.emit(self.task_id, False, "Не установлен yt-dlp: pip install yt-dlp")
             return
 
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            self._log("ERROR", FFMPEG_INSTALL_HELP, "Проверены PATH и пакет imageio-ffmpeg; исполняемый файл ffmpeg не найден.")
+            self.finished_task.emit(self.task_id, False, "Не найден FFmpeg. Установите зависимости по README.md.")
+            return
+        self._log("INFO", "FFmpeg найден.", f"Путь: {ffmpeg_path}")
+
         folder = Path(self.settings["download_paths"][platform]).expanduser()
         try:
             folder.mkdir(parents=True, exist_ok=True)
@@ -87,12 +118,16 @@ class DownloadWorker(QThread):
             "quiet": True,
             "no_warnings": False,
             "logger": WorkerYtDlpLogger(self),
+            # Pass an explicit executable path so yt-dlp also works when FFmpeg
+            # is installed inside the Python environment and is not on PATH.
+            "ffmpeg_location": ffmpeg_path,
         }
         if self.settings.get("container", "mp4") == "mp4":
             options["merge_output_format"] = "mp4"
 
         # Log the equivalent command with the URL query removed to avoid exposing tokens.
         command = ["yt-dlp", "--format", format_selector, "--output", str(folder / "%(title).180B [%(id)s].%(ext)s")]
+        command += ["--ffmpeg-location", ffmpeg_path]
         if options.get("merge_output_format"):
             command += ["--merge-output-format", "mp4"]
         command += [safe_url]

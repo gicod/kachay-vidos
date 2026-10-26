@@ -1,8 +1,8 @@
 {
     "theme": "dark",
     "download_paths": {
-        "youtube": "D:/04_Hobbies/py/video",
-        "instagram": "D:/04_Hobbies/py/video"
+        "youtube": "C:/02_Dev/py/video",
+        "instagram": "C:/02_Dev/py/video"
     },
     "quality": {
         "youtube": "1080",
