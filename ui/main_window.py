@@ -2,7 +2,7 @@ from pathlib import Path
 from datetime import datetime
 from uuid import uuid4
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
@@ -109,7 +109,7 @@ class MainWindow(QMainWindow):
         self.add_button.clicked.connect(self.add_urls)
         self.start_button = QPushButton("▶  Начать загрузку")
         self.start_button.setObjectName("primary")
-        self.start_button.clicked.connect(self.start_queue)
+        self.start_button.clicked.connect(lambda checked=False: self.start_queue(retry_errors=True))
         self.cancel_button = QPushButton("■ Отменить выбранное")
         self.cancel_button.clicked.connect(self.cancel_selected)
         controls.addWidget(self.add_button)
@@ -409,13 +409,14 @@ class MainWindow(QMainWindow):
         self._update_summary()
         self.statusBar().showMessage(f"Добавлено новых ссылок: {added}", 4000)
 
-    def start_queue(self):
+    def start_queue(self, retry_errors=True):
         if not self.settings:
             return
         active_platforms = {detect_platform(w.url) for w in self.workers.values() if w.isRunning()}
         for row in range(self.table.rowCount()):
             status = self.table.item(row, 2).text()
-            if status not in ("В очереди", "Ошибка"):
+            eligible_statuses = ("В очереди", "Ошибка") if retry_errors else ("В очереди",)
+            if status not in eligible_statuses:
                 continue
             url = self.table.item(row, 1).text()
             platform = detect_platform(url)
@@ -461,6 +462,11 @@ class MainWindow(QMainWindow):
         if worker:
             worker.deleteLater()
         self._update_summary()
+        # Start the next waiting task automatically after the thread has stopped.
+        # Failed tasks are not retried automatically, avoiding an endless retry loop.
+        QTimer.singleShot(0, lambda: self.start_queue(retry_errors=False))
+        # If no worker could be started, queued tasks may still be blocked by a
+        # platform worker that is finishing; its finished signal will continue the queue.
 
     def cancel_selected(self):
         selected_rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
