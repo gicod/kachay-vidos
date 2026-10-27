@@ -8,6 +8,15 @@ from PySide6.QtCore import QThread, Signal
 
 PLATFORM_YOUTUBE = "youtube"
 PLATFORM_INSTAGRAM = "instagram"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".bmp", ".tif", ".tiff"}
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+
+def clean_terminal_text(value):
+    """Remove ANSI color/control sequences from yt-dlp diagnostics."""
+    text = ANSI_ESCAPE_RE.sub("", str(value or ""))
+    return CONTROL_CHARS_RE.sub("", text).strip()
 
 FFMPEG_INSTALL_HELP = (
     "FFmpeg не найден. Обычно он устанавливается автоматически вместе с зависимостями проекта. "
@@ -67,7 +76,12 @@ class DownloadWorker(QThread):
         self.requestInterruption()
 
     def _log(self, level, message, details=""):
-        self.log_event.emit(self.task_id, level, message, details)
+        self.log_event.emit(
+            self.task_id,
+            level,
+            clean_terminal_text(message),
+            clean_terminal_text(details),
+        )
 
     def run(self):
         platform = detect_platform(self.url)
@@ -106,9 +120,20 @@ class DownloadWorker(QThread):
             height = int(quality)
             format_selector = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
 
+        # Download into a per-task staging directory so media from this URL can
+        # be routed after extraction without touching files from older tasks.
+        staging_dir = folder / ".working" / self.task_id
+        try:
+            staging_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            self._log("ERROR", "Не удалось создать временную папку загрузки.", repr(error))
+            self.finished_task.emit(self.task_id, False, f"Не удалось создать временную папку: {error}")
+            return
+
+        output_template = str(staging_dir / "%(title).180B [%(id)s].%(ext)s")
         options = {
             "format": format_selector,
-            "outtmpl": str(folder / "%(title).180B [%(id)s].%(ext)s"),
+            "outtmpl": output_template,
             "noplaylist": False,
             "ignoreerrors": False,
             "continuedl": True,
@@ -117,6 +142,7 @@ class DownloadWorker(QThread):
             "progress_hooks": [self._progress_hook],
             "quiet": True,
             "no_warnings": False,
+            "color": {"stdout": "never", "stderr": "never"},
             "logger": WorkerYtDlpLogger(self),
             # Pass an explicit executable path so yt-dlp also works when FFmpeg
             # is installed inside the Python environment and is not on PATH.
@@ -126,7 +152,7 @@ class DownloadWorker(QThread):
             options["merge_output_format"] = "mp4"
 
         # Log the equivalent command with the URL query removed to avoid exposing tokens.
-        command = ["yt-dlp", "--format", format_selector, "--output", str(folder / "%(title).180B [%(id)s].%(ext)s")]
+        command = ["yt-dlp", "--format", format_selector, "--output", output_template]
         command += ["--ffmpeg-location", ffmpeg_path]
         if options.get("merge_output_format"):
             command += ["--merge-output-format", "mp4"]
@@ -140,16 +166,77 @@ class DownloadWorker(QThread):
                 downloader.download([self.url])
             if self.isInterruptionRequested():
                 self._log("WARNING", "Загрузка отменена пользователем.")
-                self.finished_task.emit(self.task_id, False, "Отменено (остановка после текущего действия)")
+                self.finished_task.emit(self.task_id, False, "Отменено пользователем")
+                return
+
+            moved_count, image_count = self._organize_downloads(staging_dir, folder, platform)
+            if moved_count:
+                self._log(
+                    "INFO",
+                    f"Файлы распределены по папкам: {moved_count} файлов.",
+                    f"Изображений в отдельной папке: {image_count}",
+                )
+            if self.isInterruptionRequested():
+                self._log("WARNING", "Загрузка остановлена пользователем.")
+                self.finished_task.emit(self.task_id, False, "Отменено пользователем")
             else:
                 self._log("SUCCESS", "Загрузка успешно завершена.")
                 self.finished_task.emit(self.task_id, True, "Загрузка завершена")
         except Exception as error:
-            raw_message = str(error).strip().splitlines()
-            technical = raw_message[-1][:1000] if raw_message else repr(error)
-            explanation = explain_error(technical)
-            self._log("ERROR", explanation, technical)
-            self.finished_task.emit(self.task_id, False, f"{explanation} · {technical[:140]}")
+            if self.isInterruptionRequested() or isinstance(error, InterruptedError):
+                self._log("WARNING", "Загрузка остановлена пользователем.", clean_terminal_text(error))
+                self.finished_task.emit(self.task_id, False, "Отменено пользователем")
+            else:
+                raw_message = clean_terminal_text(error).splitlines()
+                technical = raw_message[-1][:1000] if raw_message else repr(error)
+                explanation = explain_error(technical)
+                self._log("ERROR", explanation, technical)
+                self.finished_task.emit(self.task_id, False, f"{explanation} · {technical[:140]}")
+        finally:
+            try:
+                if staging_dir.exists() and not any(staging_dir.iterdir()):
+                    staging_dir.rmdir()
+                working_root = staging_dir.parent
+                if working_root.exists() and not any(working_root.iterdir()):
+                    working_root.rmdir()
+            except OSError:
+                pass
+
+    def _organize_downloads(self, staging_dir, destination_dir, platform):
+        """Move downloaded media to final folders; Instagram photos go to Images."""
+        moved = 0
+        image_count = 0
+        image_dir = destination_dir / "Images"
+        files = [path for path in staging_dir.rglob("*") if path.is_file()]
+        for source in files:
+            # Keep sidecar metadata out of the media folders unless it is a media file.
+            if source.suffix.lower() in IMAGE_EXTENSIONS:
+                target_dir = image_dir
+                image_count += 1
+            else:
+                target_dir = destination_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / source.name
+            if target.exists():
+                stem, suffix = target.stem, target.suffix
+                index = 2
+                while (target_dir / f"{stem}_{index}{suffix}").exists():
+                    index += 1
+                target = target_dir / f"{stem}_{index}{suffix}"
+            shutil.move(str(source), str(target))
+            moved += 1
+        # Remove now-empty staging subfolders.
+        for path in sorted(staging_dir.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            staging_dir.rmdir()
+        except OSError:
+            pass
+        return moved, image_count
 
     def _progress_hook(self, data):
         if self.isInterruptionRequested():

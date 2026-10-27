@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
         self.workers = {}
         self.task_rows = {}
         self.log_entries = []
+        self.queue_paused = False
         self.setWindowTitle("Video Downloader")
         self.resize(1050, 720)
         self.setMinimumSize(820, 600)
@@ -112,9 +113,12 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(lambda checked=False: self.start_queue(retry_errors=True))
         self.cancel_button = QPushButton("■ Отменить выбранное")
         self.cancel_button.clicked.connect(self.cancel_selected)
+        self.stop_button = QPushButton("⏹ Остановить все")
+        self.stop_button.clicked.connect(self.stop_all_downloads)
         controls.addWidget(self.add_button)
         controls.addWidget(self.start_button)
         controls.addWidget(self.cancel_button)
+        controls.addWidget(self.stop_button)
         layout.addLayout(controls)
 
         self.table = QTableWidget(0, 5)
@@ -410,6 +414,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Добавлено новых ссылок: {added}", 4000)
 
     def start_queue(self, retry_errors=True):
+        # Manual click resumes the queue; internal calls after a task finishes
+        # must respect the global stop request.
+        if retry_errors:
+            self.queue_paused = False
+        elif self.queue_paused:
+            return
         if not self.settings:
             return
         active_platforms = {detect_platform(w.url) for w in self.workers.values() if w.isRunning()}
@@ -451,10 +461,13 @@ class MainWindow(QMainWindow):
         row = self.task_rows.get(task_id)
         if row is None or row >= self.table.rowCount():
             return
-        self.table.item(row, 2).setText("Готово" if success else "Ошибка")
-        self.table.item(row, 3).setText("100%" if success else self.table.item(row, 3).text())
+        cancelled = (not success) and message.lower().startswith("отменено")
+        self.table.item(row, 2).setText("Готово" if success else ("Отменено" if cancelled else "Ошибка"))
+        if success:
+            self.table.item(row, 3).setText("100%")
         self.table.item(row, 4).setText(message)
-        self._append_log("SUCCESS" if success else "ERROR", message, task_id=task_id)
+        log_level = "SUCCESS" if success else ("WARNING" if cancelled else "ERROR")
+        self._append_log(log_level, message, task_id=task_id)
         self._update_summary()
 
     def _cleanup_worker(self, task_id):
@@ -467,6 +480,28 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self.start_queue(retry_errors=False))
         # If no worker could be started, queued tasks may still be blocked by a
         # platform worker that is finishing; its finished signal will continue the queue.
+
+    def stop_all_downloads(self):
+        """Pause automatic queue progression and request cancellation of active tasks."""
+        self.queue_paused = True
+        active_count = 0
+        for task_id, worker in list(self.workers.items()):
+            if worker.isRunning():
+                worker.cancel()
+                active_count += 1
+                row = self.task_rows.get(task_id)
+                if row is not None and row < self.table.rowCount():
+                    self.table.item(row, 2).setText("Отмена…")
+                self._append_log("WARNING", "Запрошена остановка активной загрузки.", task_id=task_id)
+        self._update_summary()
+        if active_count:
+            self.statusBar().showMessage(
+                f"Остановка запрошена для активных задач: {active_count}. Очередь приостановлена.", 5000
+            )
+        else:
+            self.statusBar().showMessage(
+                "Очередь приостановлена. Нажмите «Начать загрузку», чтобы продолжить.", 5000
+            )
 
     def cancel_selected(self):
         selected_rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
@@ -504,7 +539,11 @@ class MainWindow(QMainWindow):
         for row in range(self.table.rowCount()):
             status = self.table.item(row, 2).text()
             counts[status] = counts.get(status, 0) + 1
-        self.queue_summary.setText(f"Задач: {self.table.rowCount()} · В очереди: {counts.get('В очереди', 0)} · Загружается: {counts.get('Загрузка', 0)} · Ошибок: {counts.get('Ошибка', 0)}")
+        self.queue_summary.setText(
+            f"Задач: {self.table.rowCount()} · В очереди: {counts.get('В очереди', 0)} · "
+            f"Загружается: {counts.get('Загрузка', 0) + counts.get('Отмена…', 0)} · "
+            f"Ошибок: {counts.get('Ошибка', 0)} · Отменено: {counts.get('Отменено', 0)}"
+        )
 
     def closeEvent(self, event):
         running = [worker for worker in self.workers.values() if worker.isRunning()]
