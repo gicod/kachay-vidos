@@ -2,7 +2,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 from PySide6.QtCore import QThread, Signal
 
@@ -49,6 +49,17 @@ def detect_platform(url: str):
         return PLATFORM_INSTAGRAM
     return None
 
+def is_youtube_playlist_url(url: str) -> bool:
+    """Return True for YouTube playlist links (including watch URLs with list=)."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    query = parse_qs(parsed.query)
+    return (
+        (host.endswith("youtube.com") and ("list" in query or parsed.path.rstrip("/") == "/playlist"))
+        or (host == "youtu.be" and "list" in query)
+    )
+
+
 def parse_urls(text: str):
     result = []
     seen = set()
@@ -59,8 +70,72 @@ def parse_urls(text: str):
             result.append(url)
     return result
 
+class PlaylistResolver(QThread):
+    """Resolve a YouTube playlist into individual video tasks without downloading media."""
+    resolved = Signal(str, object, str)  # source_task_id, entries, error
+    log_event = Signal(str, str, str, str)
+
+    def __init__(self, task_id, url):
+        super().__init__()
+        self.task_id = task_id
+        self.url = url
+
+    def run(self):
+        safe_url = urlunparse(urlparse(self.url)._replace(query="", fragment=""))
+        self.log_event.emit(self.task_id, "INFO", "Разбор плейлиста YouTube.", safe_url)
+        try:
+            import yt_dlp
+            options = {
+                "extract_flat": "in_playlist",
+                "skip_download": True,
+                "quiet": True,
+                "no_warnings": False,
+                "ignoreerrors": True,
+                "noplaylist": False,
+                "color": {"stdout": "never", "stderr": "never"},
+                "logger": WorkerYtDlpLogger(self),
+            }
+            with yt_dlp.YoutubeDL(options) as downloader:
+                info = downloader.extract_info(self.url, download=False)
+            if self.isInterruptionRequested():
+                self.resolved.emit(self.task_id, [], "Разбор плейлиста отменён пользователем.")
+                return
+            if not info:
+                raise RuntimeError("yt-dlp не вернул информацию о плейлисте.")
+            raw_entries = info.get("entries")
+            if raw_entries is None:
+                # The URL may have been recognized as a playlist candidate but resolve to one video.
+                raw_entries = [info]
+            entries = []
+            for entry in raw_entries:
+                if not entry:
+                    continue
+                video_id = entry.get("id")
+                video_url = entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
+                if video_url and not str(video_url).startswith(("http://", "https://")):
+                    if video_id:
+                        video_url = f"https://www.youtube.com/watch?v={video_id}"
+                if not video_url and video_id:
+                    video_url = f"https://www.youtube.com/watch?v={video_id}"
+                if not video_url:
+                    continue
+                entries.append({"url": str(video_url), "title": str(entry.get("title") or "Без названия")})
+            if not entries:
+                raise RuntimeError("В плейлисте не найдено доступных видео.")
+            self.log_event.emit(self.task_id, "SUCCESS", f"Найдено видео в плейлисте: {len(entries)}.", "")
+            self.resolved.emit(self.task_id, entries, "")
+        except Exception as error:
+            details = clean_terminal_text(error)
+            self.log_event.emit(self.task_id, "ERROR", explain_error(details), details)
+            self.resolved.emit(self.task_id, [], explain_error(details) + " " + details[:200])
+
+    def _log(self, level, message, details=""):
+        self.log_event.emit(self.task_id, level, clean_terminal_text(message), clean_terminal_text(details))
+
+
 class DownloadWorker(QThread):
     progress = Signal(str, int, str)
+    title_changed = Signal(str, str)
     finished_task = Signal(str, bool, str)
     log_event = Signal(str, str, str, str)  # task_id, level, message, technical details
 
@@ -70,6 +145,7 @@ class DownloadWorker(QThread):
         self.url = url
         self.settings = settings
         self._cancel_requested = False
+        self._last_title = ""
 
     def cancel(self):
         self._cancel_requested = True
@@ -239,6 +315,12 @@ class DownloadWorker(QThread):
         return moved, image_count
 
     def _progress_hook(self, data):
+        info = data.get("info_dict") or {}
+        title = clean_terminal_text(info.get("title") or "")
+        if title and title != self._last_title:
+            self._last_title = title
+            self.title_changed.emit(self.task_id, title)
+            self._log("INFO", f"Начата загрузка видео: {title}")
         if self.isInterruptionRequested():
             raise InterruptedError("Отмена запрошена")
         status = data.get("status")

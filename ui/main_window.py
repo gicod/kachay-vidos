@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QTextCursor
 
 from core.settings import load_settings, save_settings
-from core.downloader import DownloadWorker, detect_platform, parse_urls
+from core.downloader import DownloadWorker, PlaylistResolver, detect_platform, is_youtube_playlist_url, parse_urls
 
 APP_STYLE = r"""
 QWidget { background: #17191f; color: #edf0f7; font-size: 13px; }
@@ -46,6 +46,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = load_settings()
         self.workers = {}
+        self.resolvers = {}
+        self.task_titles = {}
         self.task_rows = {}
         self.log_entries = []
         self.queue_paused = False
@@ -390,32 +392,75 @@ class MainWindow(QMainWindow):
         for url in urls:
             if url in existing:
                 continue
-            platform = detect_platform(url)
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            task_id = str(uuid4())
-            platform_name = {"youtube": "YouTube", "instagram": "Instagram"}.get(platform, "Неизвестно")
-            values = [platform_name, url, "В очереди", "0%", ""]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if col == 1:
-                    item.setToolTip(url)
-                self.table.setItem(row, col, item)
-            self.table.setRowHeight(row, 42)
-            self.task_rows[task_id] = row
-            self.table.item(row, 0).setData(Qt.UserRole, task_id)
-            if not platform:
-                self.table.item(row, 2).setText("Ошибка")
-                self.table.item(row, 4).setText("Неподдерживаемая ссылка")
+            self._insert_task(url)
             added += 1
             existing.add(url)
         self.url_input.clear()
         self._update_summary()
         self.statusBar().showMessage(f"Добавлено новых ссылок: {added}", 4000)
 
+    def _insert_task(self, url, title=""):
+        platform = detect_platform(url)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        task_id = str(uuid4())
+        platform_name = {"youtube": "YouTube", "instagram": "Instagram"}.get(platform, "Неизвестно")
+        result = title or ("Плейлист будет разделён на отдельные задачи" if is_youtube_playlist_url(url) else "")
+        values = [platform_name, url, "В очереди", "0%", result]
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            if col == 1:
+                item.setToolTip(url)
+            self.table.setItem(row, col, item)
+        self.table.setRowHeight(row, 42)
+        self.task_rows[task_id] = row
+        self.table.item(row, 0).setData(Qt.UserRole, task_id)
+        if title:
+            self.task_titles[task_id] = title
+        if not platform:
+            self.table.item(row, 2).setText("Ошибка")
+            self.table.item(row, 4).setText("Неподдерживаемая ссылка")
+        return task_id
+
+    def _rebuild_task_rows(self):
+        self.task_rows.clear()
+        for row in range(self.table.rowCount()):
+            task_id = self.table.item(row, 0).data(Qt.UserRole)
+            if task_id:
+                self.task_rows[task_id] = row
+
+    def on_playlist_resolved(self, task_id, entries, error):
+        row = self.task_rows.get(task_id)
+        if row is None or row >= self.table.rowCount():
+            return
+        original_url = self.table.item(row, 1).text()
+        if error or not entries:
+            cancelled = bool(error and "отмен" in error.lower())
+            self.table.item(row, 2).setText("Отменено" if cancelled else "Ошибка")
+            self.table.item(row, 4).setText(error or "Не удалось получить видео из плейлиста")
+            self._append_log("WARNING" if cancelled else "ERROR", error or "Плейлист пуст или недоступен.", task_id=task_id)
+            self._update_summary()
+            return
+
+        self._append_log("INFO", f"Плейлист раскрыт в отдельные задачи: {len(entries)} видео.", task_id=task_id)
+        self.table.removeRow(row)
+        self.task_rows.pop(task_id, None)
+        self.task_titles.pop(task_id, None)
+        self._rebuild_task_rows()
+        existing = {self.table.item(i, 1).text() for i in range(self.table.rowCount())}
+        inserted = 0
+        for entry in entries:
+            video_url = entry.get("url", "").strip()
+            if not video_url or video_url in existing:
+                continue
+            self._insert_task(video_url, entry.get("title", ""))
+            existing.add(video_url)
+            inserted += 1
+        self.statusBar().showMessage(f"Плейлист разделён на отдельные задачи: {inserted} видео", 5000)
+        self._update_summary()
+
     def start_queue(self, retry_errors=True):
-        # Manual click resumes the queue; internal calls after a task finishes
-        # must respect the global stop request.
+        # Manual click resumes the queue; internal calls respect a stop request.
         if retry_errors:
             self.queue_paused = False
         elif self.queue_paused:
@@ -423,6 +468,9 @@ class MainWindow(QMainWindow):
         if not self.settings:
             return
         active_platforms = {detect_platform(w.url) for w in self.workers.values() if w.isRunning()}
+        active_platforms.update(detect_platform(self.table.item(self.task_rows[tid], 1).text())
+                                for tid, resolver in self.resolvers.items()
+                                if resolver.isRunning() and tid in self.task_rows)
         for row in range(self.table.rowCount()):
             status = self.table.item(row, 2).text()
             eligible_statuses = ("В очереди", "Ошибка") if retry_errors else ("В очереди",)
@@ -430,32 +478,60 @@ class MainWindow(QMainWindow):
                 continue
             url = self.table.item(row, 1).text()
             platform = detect_platform(url)
-            if not platform:
-                continue
-            if platform in active_platforms:
+            if not platform or platform in active_platforms:
                 continue
             task_id = self.table.item(row, 0).data(Qt.UserRole)
+            if task_id in self.resolvers:
+                continue
+            if platform == "youtube" and is_youtube_playlist_url(url):
+                resolver = PlaylistResolver(task_id, url)
+                resolver.resolved.connect(self.on_playlist_resolved)
+                resolver.log_event.connect(self.on_log_event)
+                resolver.finished.connect(lambda tid=task_id: self._cleanup_resolver(tid))
+                self.resolvers[task_id] = resolver
+                self.table.item(row, 2).setText("Разбор плейлиста")
+                self.table.item(row, 4).setText("Получение списка видео…")
+                resolver.start()
+                active_platforms.add(platform)
+                continue
             worker = DownloadWorker(task_id, url, self.settings.copy())
             worker.progress.connect(self.on_progress)
+            worker.title_changed.connect(self.on_title_changed)
             worker.finished_task.connect(self.on_finished)
             worker.log_event.connect(self.on_log_event)
             worker.finished.connect(lambda tid=task_id: self._cleanup_worker(tid))
             self.workers[task_id] = worker
             self.table.item(row, 2).setText("Загрузка")
-            self.table.item(row, 4).setText("Подключение…")
+            self.table.item(row, 4).setText(self.task_titles.get(task_id, "Получение названия видео…"))
             worker.start()
             active_platforms.add(platform)
         self._update_summary()
 
+    def _cleanup_resolver(self, task_id):
+        resolver = self.resolvers.pop(task_id, None)
+        if resolver:
+            resolver.deleteLater()
+        self._update_summary()
+        QTimer.singleShot(0, lambda: self.start_queue(retry_errors=False))
+
     def on_log_event(self, task_id, level, message, details):
         self._append_log(level, message, details, task_id)
+
+    def on_title_changed(self, task_id, title):
+        self.task_titles[task_id] = title
+        row = self.task_rows.get(task_id)
+        if row is not None and row < self.table.rowCount():
+            self.table.item(row, 4).setText(title)
+            self.table.item(row, 4).setToolTip(title)
 
     def on_progress(self, task_id, percent, speed):
         row = self.task_rows.get(task_id)
         if row is None or row >= self.table.rowCount():
             return
         self.table.item(row, 3).setText(f"{percent}%")
-        self.table.item(row, 4).setText(speed or "Загрузка…")
+        title = self.task_titles.get(task_id, "")
+        result = f"{title} · {speed}" if title and speed else (title or speed or "Загрузка…")
+        self.table.item(row, 4).setText(result)
 
     def on_finished(self, task_id, success, message):
         row = self.task_rows.get(task_id)
@@ -485,6 +561,14 @@ class MainWindow(QMainWindow):
         """Pause automatic queue progression and request cancellation of active tasks."""
         self.queue_paused = True
         active_count = 0
+        for task_id, resolver in list(self.resolvers.items()):
+            if resolver.isRunning():
+                resolver.requestInterruption()
+                active_count += 1
+                row = self.task_rows.get(task_id)
+                if row is not None and row < self.table.rowCount():
+                    self.table.item(row, 2).setText("Отмена…")
+                self._append_log("WARNING", "Запрошена остановка разбора плейлиста.", task_id=task_id)
         for task_id, worker in list(self.workers.items()):
             if worker.isRunning():
                 worker.cancel()
@@ -510,6 +594,12 @@ class MainWindow(QMainWindow):
             return
         for row in selected_rows:
             task_id = self.table.item(row, 0).data(Qt.UserRole)
+            resolver = self.resolvers.get(task_id)
+            if resolver and resolver.isRunning():
+                resolver.requestInterruption()
+                self.table.item(row, 2).setText("Отмена…")
+                self._append_log("WARNING", "Запрошена отмена разбора плейлиста.", task_id=task_id)
+                continue
             worker = self.workers.get(task_id)
             if worker and worker.isRunning():
                 worker.cancel()
@@ -527,6 +617,7 @@ class MainWindow(QMainWindow):
             if self.table.item(row, 2).text() in removable:
                 task_id = self.table.item(row, 0).data(Qt.UserRole)
                 self.task_rows.pop(task_id, None)
+                self.task_titles.pop(task_id, None)
                 self.table.removeRow(row)
         self.task_rows.clear()
         for row in range(self.table.rowCount()):
@@ -541,13 +632,14 @@ class MainWindow(QMainWindow):
             counts[status] = counts.get(status, 0) + 1
         self.queue_summary.setText(
             f"Задач: {self.table.rowCount()} · В очереди: {counts.get('В очереди', 0)} · "
-            f"Загружается: {counts.get('Загрузка', 0) + counts.get('Отмена…', 0)} · "
+            f"Загружается: {counts.get('Загрузка', 0) + counts.get('Разбор плейлиста', 0) + counts.get('Отмена…', 0)} · "
             f"Ошибок: {counts.get('Ошибка', 0)} · Отменено: {counts.get('Отменено', 0)}"
         )
 
     def closeEvent(self, event):
         running = [worker for worker in self.workers.values() if worker.isRunning()]
-        if running:
+        running_resolvers = [resolver for resolver in self.resolvers.values() if resolver.isRunning()]
+        if running or running_resolvers:
             answer = QMessageBox.question(
                 self, "Загрузки выполняются",
                 "Есть активные загрузки. Закрыть приложение и прервать их?",
@@ -556,6 +648,9 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 event.ignore()
                 return
+            for resolver in running_resolvers:
+                resolver.requestInterruption()
+                resolver.wait(2500)
             for worker in running:
                 worker.cancel()
                 worker.wait(2500)
