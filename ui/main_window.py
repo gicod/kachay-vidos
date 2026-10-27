@@ -544,8 +544,11 @@ class MainWindow(QMainWindow):
             return
         self.table.item(row, 3).setText(f"{percent}%")
         title = self.task_titles.get(task_id, "")
-        result = f"{title} · {speed}" if title and speed else (title or speed or "Загрузка…")
+        # Keep the video title on the first line; progress details go below it.
+        details = speed or "Загрузка…"
+        result = f"{title}\n{details}" if title else details
         self.table.item(row, 4).setText(result)
+        self.table.item(row, 4).setToolTip(title if title else details)
 
     def on_finished(self, task_id, success, message):
         row = self.task_rows.get(task_id)
@@ -555,7 +558,11 @@ class MainWindow(QMainWindow):
         self.table.item(row, 2).setText("Готово" if success else ("Отменено" if cancelled else "Ошибка"))
         if success:
             self.table.item(row, 3).setText("100%")
-        self.table.item(row, 4).setText(message)
+        title = self.task_titles.get(task_id, "")
+        result = f"{title}\n{message}" if title else message
+        self.table.item(row, 4).setText(result)
+        if title:
+            self.table.item(row, 4).setToolTip(title)
         log_level = "SUCCESS" if success else ("WARNING" if cancelled else "ERROR")
         self._append_log(log_level, message, task_id=task_id)
         self._update_summary()
