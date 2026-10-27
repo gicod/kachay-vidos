@@ -60,6 +60,13 @@ def is_youtube_playlist_url(url: str) -> bool:
     )
 
 
+def safe_folder_name(value: str, max_length: int = 100) -> str:
+    """Return a Windows-safe folder name for a playlist."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value or "").strip())
+    name = re.sub(r"\s+", " ", name).strip(" ._")
+    return (name[:max_length].rstrip(" .") or "YouTube playlist")
+
+
 def parse_urls(text: str):
     result = []
     seen = set()
@@ -106,6 +113,13 @@ class PlaylistResolver(QThread):
             if raw_entries is None:
                 # The URL may have been recognized as a playlist candidate but resolve to one video.
                 raw_entries = [info]
+            playlist_title = str(info.get("title") or "YouTube playlist")
+            parsed_query = parse_qs(urlparse(self.url).query)
+            playlist_id = (parsed_query.get("list") or [""])[0]
+            folder_name = safe_folder_name(playlist_title)
+            if playlist_id:
+                folder_name = safe_folder_name(f"{folder_name} [{playlist_id}]")
+
             entries = []
             for entry in raw_entries:
                 if not entry:
@@ -119,7 +133,12 @@ class PlaylistResolver(QThread):
                     video_url = f"https://www.youtube.com/watch?v={video_id}"
                 if not video_url:
                     continue
-                entries.append({"url": str(video_url), "title": str(entry.get("title") or "Без названия")})
+                entries.append({
+                    "url": str(video_url),
+                    "title": str(entry.get("title") or "Без названия"),
+                    "playlist_title": playlist_title,
+                    "playlist_folder": folder_name,
+                })
             if not entries:
                 raise RuntimeError("В плейлисте не найдено доступных видео.")
             self.log_event.emit(self.task_id, "SUCCESS", f"Найдено видео в плейлисте: {len(entries)}.", "")
@@ -139,11 +158,12 @@ class DownloadWorker(QThread):
     finished_task = Signal(str, bool, str)
     log_event = Signal(str, str, str, str)  # task_id, level, message, technical details
 
-    def __init__(self, task_id, url, settings):
+    def __init__(self, task_id, url, settings, playlist_folder=""):
         super().__init__()
         self.task_id = task_id
         self.url = url
         self.settings = settings
+        self.playlist_folder = safe_folder_name(playlist_folder) if playlist_folder else ""
         self._cancel_requested = False
         self._last_title = ""
 
@@ -182,6 +202,9 @@ class DownloadWorker(QThread):
         self._log("INFO", "FFmpeg найден.", f"Путь: {ffmpeg_path}")
 
         folder = Path(self.settings["download_paths"][platform]).expanduser()
+        if platform == PLATFORM_YOUTUBE and self.playlist_folder:
+            # Every expanded playlist is saved into its own uniquely named directory.
+            folder = folder / "Playlists" / self.playlist_folder
         try:
             folder.mkdir(parents=True, exist_ok=True)
         except OSError as error:

@@ -48,6 +48,7 @@ class MainWindow(QMainWindow):
         self.workers = {}
         self.resolvers = {}
         self.task_titles = {}
+        self.task_playlist_folders = {}
         self.task_rows = {}
         self.log_entries = []
         self.queue_paused = False
@@ -399,7 +400,7 @@ class MainWindow(QMainWindow):
         self._update_summary()
         self.statusBar().showMessage(f"Добавлено новых ссылок: {added}", 4000)
 
-    def _insert_task(self, url, title=""):
+    def _insert_task(self, url, title="", playlist_folder=""):
         platform = detect_platform(url)
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -417,6 +418,8 @@ class MainWindow(QMainWindow):
         self.table.item(row, 0).setData(Qt.UserRole, task_id)
         if title:
             self.task_titles[task_id] = title
+        if playlist_folder and platform == "youtube":
+            self.task_playlist_folders[task_id] = playlist_folder
         if not platform:
             self.table.item(row, 2).setText("Ошибка")
             self.table.item(row, 4).setText("Неподдерживаемая ссылка")
@@ -453,7 +456,11 @@ class MainWindow(QMainWindow):
             video_url = entry.get("url", "").strip()
             if not video_url or video_url in existing:
                 continue
-            self._insert_task(video_url, entry.get("title", ""))
+            self._insert_task(
+                video_url,
+                entry.get("title", ""),
+                entry.get("playlist_folder", entry.get("playlist_title", "")),
+            )
             existing.add(video_url)
             inserted += 1
         self.statusBar().showMessage(f"Плейлист разделён на отдельные задачи: {inserted} видео", 5000)
@@ -473,7 +480,9 @@ class MainWindow(QMainWindow):
                                 if resolver.isRunning() and tid in self.task_rows)
         for row in range(self.table.rowCount()):
             status = self.table.item(row, 2).text()
-            eligible_statuses = ("В очереди", "Ошибка") if retry_errors else ("В очереди",)
+            # A manual click retries failed tasks and resumes canceled tasks.
+            # Internal queue progression only starts tasks that have never been canceled/failed.
+            eligible_statuses = ("В очереди", "Ошибка", "Отменено") if retry_errors else ("В очереди",)
             if status not in eligible_statuses:
                 continue
             url = self.table.item(row, 1).text()
@@ -494,7 +503,12 @@ class MainWindow(QMainWindow):
                 resolver.start()
                 active_platforms.add(platform)
                 continue
-            worker = DownloadWorker(task_id, url, self.settings.copy())
+            worker = DownloadWorker(
+                task_id,
+                url,
+                self.settings.copy(),
+                playlist_folder=self.task_playlist_folders.get(task_id, ""),
+            )
             worker.progress.connect(self.on_progress)
             worker.title_changed.connect(self.on_title_changed)
             worker.finished_task.connect(self.on_finished)
@@ -618,6 +632,7 @@ class MainWindow(QMainWindow):
                 task_id = self.table.item(row, 0).data(Qt.UserRole)
                 self.task_rows.pop(task_id, None)
                 self.task_titles.pop(task_id, None)
+                self.task_playlist_folders.pop(task_id, None)
                 self.table.removeRow(row)
         self.task_rows.clear()
         for row in range(self.table.rowCount()):
