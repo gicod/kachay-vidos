@@ -2,7 +2,7 @@
     "theme": "dark",
     "download_paths": {
         "youtube": "C:/02_Dev/py/video",
-        "instagram": "C:/02_Dev/py/video"
+        "instagram": "C:/02_Dev/py/video/test"
     },
     "quality": {
         "youtube": "1080",

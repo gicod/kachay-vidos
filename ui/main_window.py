@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
         self.task_playlist_folders = {}
         self.task_rows = {}
         self.task_speeds = {}
+        self.task_durations = {}
         self.log_entries = []
         self.history = DownloadHistory()
         self.queue_paused = False
@@ -71,36 +72,40 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(14)
 
+        # One-line header: large app name on the left, compact live status on the right.
         header = QHBoxLayout()
-        title_col = QVBoxLayout()
+        header.setSpacing(18)
         title = QLabel("kachay-vidos")
-        title.setStyleSheet("font-size: 24px; font-weight: 700;")
-        title_col.addWidget(title)
-        header.addLayout(title_col)
-        header.addStretch()
-        layout.addLayout(header)
+        title.setStyleSheet("font-size: 28px; font-weight: 750; letter-spacing: 0.2px;")
+        header.addWidget(title, 0, Qt.AlignVCenter)
+        header.addStretch(1)
 
-        # Compact live status panel at the top of the application.
         self.activity_dot = QLabel("●")
-        self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 18px;")
-        self.activity_label = QLabel("Нет активных загрузок")
+        self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 15px;")
+        self.activity_label = QLabel("Готово")
         self.activity_label.setStyleSheet("font-weight: 600; color: #b8c0d0;")
-        self.speed_label = QLabel("Скорость: 0 Б/с")
+        self.overall_progress_label = QLabel("0/0 файлов")
+        self.overall_progress_label.setStyleSheet("color: #9ba3b5;")
+        self.speed_label = QLabel("0 Б/с")
         self.speed_label.setStyleSheet("color: #9ba3b5;")
-        self.active_count_label = QLabel("Активно: 0")
+        self.active_count_label = QLabel("Очередь: 0")
         self.active_count_label.setStyleSheet("color: #9ba3b5;")
         status_panel = QHBoxLayout()
-        status_panel.setContentsMargins(10, 7, 10, 7)
+        status_panel.setContentsMargins(10, 6, 10, 6)
+        status_panel.setSpacing(10)
         status_panel.addWidget(self.activity_dot)
         status_panel.addWidget(self.activity_label)
-        status_panel.addSpacing(18)
+        status_panel.addWidget(self._make_status_separator())
+        status_panel.addWidget(self.overall_progress_label)
+        status_panel.addWidget(self._make_status_separator())
         status_panel.addWidget(self.speed_label)
-        status_panel.addStretch()
+        status_panel.addWidget(self._make_status_separator())
         status_panel.addWidget(self.active_count_label)
         self.top_status_panel = QWidget()
         self.top_status_panel.setLayout(status_panel)
         self.top_status_panel.setStyleSheet("QWidget { background: #22252e; border: 1px solid #343947; border-radius: 7px; }")
-        layout.addWidget(self.top_status_panel)
+        header.addWidget(self.top_status_panel, 0, Qt.AlignVCenter)
+        layout.addLayout(header)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
@@ -120,6 +125,12 @@ class MainWindow(QMainWindow):
         self._build_history_tab()
         self._build_changelog_tab()
         self.setStatusBar(QStatusBar())
+
+    @staticmethod
+    def _make_status_separator():
+        separator = QLabel("·")
+        separator.setStyleSheet("color: #555d6d;")
+        return separator
 
     def _build_download_tab(self):
         layout = QVBoxLayout(self.download_tab)
@@ -188,13 +199,14 @@ class MainWindow(QMainWindow):
         controls.addWidget(refresh_button)
         layout.addLayout(controls)
 
-        self.history_table = QTableWidget(0, 5)
-        self.history_table.setHorizontalHeaderLabels(["Дата загрузки", "Платформа", "Название", "Файл", "Размер"])
+        self.history_table = QTableWidget(0, 6)
+        self.history_table.setHorizontalHeaderLabels(["Дата загрузки", "Платформа", "Название", "Файл", "Длительность", "Размер"])
         self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.history_table.setAlternatingRowColors(False)
@@ -249,6 +261,18 @@ class MainWindow(QMainWindow):
                 return f"{value:.1f} {unit}" if unit != "Б" else f"{int(value)} Б"
             value /= 1024
 
+    @staticmethod
+    def _format_duration(seconds):
+        if seconds is None or seconds == "":
+            return "—"
+        try:
+            total = max(0, int(float(seconds)))
+        except (TypeError, ValueError):
+            return "—"
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
     def _refresh_history(self, *_):
         if not hasattr(self, "history_table"):
             return
@@ -257,8 +281,11 @@ class MainWindow(QMainWindow):
         for record in rows:
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
-            date_text = record["downloaded_at"].replace("T", " ")
-            values = [date_text, record["platform"], record["title"], record["file_path"], self._format_file_size(record["file_size"])]
+            try:
+                date_text = datetime.fromisoformat(record["downloaded_at"]).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                date_text = str(record["downloaded_at"]).replace("T", " ")[:16]
+            values = [date_text, record["platform"], record["title"], record["file_path"], self._format_duration(record["duration_seconds"]), self._format_file_size(record["file_size"])]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setToolTip(str(record["file_path"]))
@@ -300,7 +327,8 @@ class MainWindow(QMainWindow):
         platform = detect_platform(url) or "unknown"
         platform_name = {"youtube": "YouTube", "instagram": "Instagram"}.get(platform, platform)
         title = self.task_titles.get(task_id, "")
-        self.history.add_files(task_id, platform_name, title, url, file_paths)
+        duration = getattr(self, "task_durations", {}).get(task_id)
+        self.history.add_files(task_id, platform_name, title, url, file_paths, duration_seconds=duration)
         self._refresh_history()
         self._append_log("SUCCESS", f"В историю SQLite добавлено файлов: {len(file_paths)}", task_id=task_id)
 
@@ -667,6 +695,7 @@ class MainWindow(QMainWindow):
             )
             worker.progress.connect(self.on_progress)
             worker.title_changed.connect(self.on_title_changed)
+            worker.duration_changed.connect(self.on_duration_changed)
             worker.finished_task.connect(self.on_finished)
             worker.downloaded_files.connect(self.on_downloaded_files)
             worker.log_event.connect(self.on_log_event)
@@ -695,6 +724,9 @@ class MainWindow(QMainWindow):
         if row is not None and row < self.table.rowCount():
             self.table.item(row, 4).setText(title)
             self.table.item(row, 4).setToolTip(title)
+
+    def on_duration_changed(self, task_id, duration_seconds):
+        self.task_durations[task_id] = duration_seconds
 
     def on_progress(self, task_id, percent, speed):
         row = self.task_rows.get(task_id)
@@ -814,20 +846,39 @@ class MainWindow(QMainWindow):
     def _update_activity_status(self):
         active_ids = [tid for tid, worker in self.workers.items() if worker.isRunning()]
         active_ids += [tid for tid, resolver in self.resolvers.items() if resolver.isRunning()]
-        active_count = len(set(active_ids))
+        active_ids = list(set(active_ids))
+        active_count = len(active_ids)
+        total_tasks = self.table.rowCount() if hasattr(self, "table") else 0
+        completed = 0
+        queued = 0
+        progress_values = []
+        for row in range(total_tasks):
+            status_item = self.table.item(row, 2)
+            progress_item = self.table.item(row, 3)
+            if status_item and status_item.text() == "Готово":
+                completed += 1
+            elif status_item and status_item.text() == "В очереди":
+                queued += 1
+            if progress_item:
+                try:
+                    progress_values.append(max(0, min(100, int(progress_item.text().replace("%", "")))))
+                except ValueError:
+                    progress_values.append(0)
+        overall = int(sum(progress_values) / len(progress_values)) if progress_values else 0
         if active_count:
-            self.activity_dot.setStyleSheet("color: #36c979; font-size: 18px;")
-            self.activity_label.setText("Идёт загрузка")
+            self.activity_dot.setStyleSheet("color: #36c979; font-size: 15px;")
+            self.activity_label.setText("Загрузка")
             self.activity_label.setStyleSheet("font-weight: 600; color: #36c979;")
             speeds = [value for tid, value in self.task_speeds.items() if tid in active_ids and value]
-            speed_text = ", ".join(speeds) if speeds else "ожидание скорости…"
-            self.speed_label.setText(f"Скорость: {speed_text}")
+            speed_text = " + ".join(speeds) if speeds else "ожидание скорости"
+            self.speed_label.setText(speed_text)
         else:
-            self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 18px;")
-            self.activity_label.setText("Нет активных загрузок")
+            self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 15px;")
+            self.activity_label.setText("Готово")
             self.activity_label.setStyleSheet("font-weight: 600; color: #b8c0d0;")
-            self.speed_label.setText("Скорость: 0 Б/с")
-        self.active_count_label.setText(f"Активно: {active_count}")
+            self.speed_label.setText("0 Б/с")
+        self.overall_progress_label.setText(f"{completed}/{total_tasks} готово · {overall}%")
+        self.active_count_label.setText(f"Очередь: {queued} · Активно: {active_count}")
 
     def _update_summary(self):
         counts = {}

@@ -155,6 +155,7 @@ class PlaylistResolver(QThread):
 class DownloadWorker(QThread):
     progress = Signal(str, int, str)
     title_changed = Signal(str, str)
+    duration_changed = Signal(str, object)
     finished_task = Signal(str, bool, str)
     downloaded_files = Signal(str, object)  # task_id, list of final file paths
     log_event = Signal(str, str, str, str)  # task_id, level, message, technical details
@@ -349,6 +350,12 @@ class DownloadWorker(QThread):
             self._last_title = title
             self.title_changed.emit(self.task_id, title)
             self._log("INFO", f"Начата загрузка видео: {title}")
+        duration = info.get("duration")
+        if duration is not None:
+            try:
+                self.duration_changed.emit(self.task_id, int(float(duration)))
+            except (TypeError, ValueError):
+                pass
         if self.isInterruptionRequested():
             raise InterruptedError("Отмена запрошена")
         status = data.get("status")

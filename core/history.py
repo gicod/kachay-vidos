@@ -26,12 +26,16 @@ class DownloadHistory:
                     source_url TEXT NOT NULL,
                     file_path TEXT NOT NULL UNIQUE,
                     file_size INTEGER NOT NULL DEFAULT 0,
+                    duration_seconds INTEGER,
                     downloaded_at TEXT NOT NULL
                 )
             """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(downloads)")}
+            if "duration_seconds" not in columns:
+                connection.execute("ALTER TABLE downloads ADD COLUMN duration_seconds INTEGER")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(downloaded_at DESC)")
 
-    def add_files(self, task_id, platform, title, source_url, file_paths):
+    def add_files(self, task_id, platform, title, source_url, file_paths, duration_seconds=None):
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         records = []
         for value in file_paths:
@@ -40,23 +44,24 @@ class DownloadHistory:
                 size = path.stat().st_size
             except OSError:
                 size = 0
-            records.append((str(task_id), str(platform), str(title or path.stem), str(source_url), str(path.resolve()), size, timestamp))
+            media_duration = None if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"} else duration_seconds
+            records.append((str(task_id), str(platform), str(title or path.stem), str(source_url), str(path.resolve()), size, media_duration, timestamp))
         if records:
             with self._connect() as connection:
                 connection.executemany("""
-                    INSERT INTO downloads (task_id, platform, title, source_url, file_path, file_size, downloaded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO downloads (task_id, platform, title, source_url, file_path, file_size, duration_seconds, downloaded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(file_path) DO UPDATE SET
                         task_id=excluded.task_id, platform=excluded.platform, title=excluded.title,
                         source_url=excluded.source_url, file_size=excluded.file_size,
-                        downloaded_at=excluded.downloaded_at
+                        duration_seconds=excluded.duration_seconds, downloaded_at=excluded.downloaded_at
                 """, records)
 
     def list_files(self, search=""):
         query = "%" + search.strip() + "%"
         with self._connect() as connection:
             return connection.execute("""
-                SELECT id, task_id, platform, title, source_url, file_path, file_size, downloaded_at
+                SELECT id, task_id, platform, title, source_url, file_path, file_size, duration_seconds, downloaded_at
                 FROM downloads
                 WHERE title LIKE ? OR file_path LIKE ? OR source_url LIKE ? OR platform LIKE ?
                 ORDER BY downloaded_at DESC, id DESC
