@@ -156,6 +156,7 @@ class DownloadWorker(QThread):
     progress = Signal(str, int, str)
     title_changed = Signal(str, str)
     finished_task = Signal(str, bool, str)
+    downloaded_files = Signal(str, object)  # task_id, list of final file paths
     log_event = Signal(str, str, str, str)  # task_id, level, message, technical details
 
     def __init__(self, task_id, url, settings, playlist_folder=""):
@@ -268,7 +269,9 @@ class DownloadWorker(QThread):
                 self.finished_task.emit(self.task_id, False, "Отменено пользователем")
                 return
 
-            moved_count, image_count = self._organize_downloads(staging_dir, folder, platform)
+            moved_count, image_count, final_paths = self._organize_downloads(staging_dir, folder, platform)
+            if final_paths:
+                self.downloaded_files.emit(self.task_id, [str(path) for path in final_paths])
             if moved_count:
                 self._log(
                     "INFO",
@@ -305,6 +308,7 @@ class DownloadWorker(QThread):
         """Move downloaded media to final folders; Instagram photos go to Images."""
         moved = 0
         image_count = 0
+        final_paths = []
         image_dir = destination_dir / "Images"
         files = [path for path in staging_dir.rglob("*") if path.is_file()]
         for source in files:
@@ -323,6 +327,7 @@ class DownloadWorker(QThread):
                     index += 1
                 target = target_dir / f"{stem}_{index}{suffix}"
             shutil.move(str(source), str(target))
+            final_paths.append(target)
             moved += 1
         # Remove now-empty staging subfolders.
         for path in sorted(staging_dir.rglob("*"), key=lambda item: len(item.parts), reverse=True):
@@ -335,7 +340,7 @@ class DownloadWorker(QThread):
             staging_dir.rmdir()
         except OSError:
             pass
-        return moved, image_count
+        return moved, image_count, final_paths
 
     def _progress_hook(self, data):
         info = data.get("info_dict") or {}

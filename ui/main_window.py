@@ -9,9 +9,11 @@ from PySide6.QtWidgets import (
     QComboBox, QTabWidget, QFormLayout, QLineEdit, QFileDialog, QMessageBox,
     QGroupBox, QAbstractItemView, QStatusBar
 )
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextCursor, QDesktopServices
+from PySide6.QtCore import QUrl
 
 from core.settings import load_settings, save_settings
+from core.history import DownloadHistory
 from core.downloader import DownloadWorker, PlaylistResolver, detect_platform, is_youtube_playlist_url, parse_urls
 
 APP_STYLE = r"""
@@ -51,6 +53,7 @@ class MainWindow(QMainWindow):
         self.task_playlist_folders = {}
         self.task_rows = {}
         self.log_entries = []
+        self.history = DownloadHistory()
         self.queue_paused = False
         self.setWindowTitle("Video Downloader")
         self.resize(1050, 720)
@@ -87,12 +90,15 @@ class MainWindow(QMainWindow):
         self.download_tab = QWidget()
         self.settings_tab = QWidget()
         self.logs_tab = QWidget()
+        self.history_tab = QWidget()
         self.tabs.addTab(self.download_tab, "Загрузки")
+        self.tabs.addTab(self.history_tab, "История")
         self.tabs.addTab(self.settings_tab, "Настройки")
         self.tabs.addTab(self.logs_tab, "Логи")
         self._build_download_tab()
         self._build_settings_tab()
         self._build_logs_tab()
+        self._build_history_tab()
         self.setStatusBar(QStatusBar())
 
     def _build_download_tab(self):
@@ -146,6 +152,111 @@ class MainWindow(QMainWindow):
         footer.addWidget(clear_button)
         layout.addLayout(footer)
 
+
+    def _build_history_tab(self):
+        layout = QVBoxLayout(self.history_tab)
+        layout.setContentsMargins(8, 12, 8, 8)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("История успешно скачанных файлов · хранится локально в SQLite"))
+        controls = QHBoxLayout()
+        self.history_search = QLineEdit()
+        self.history_search.setPlaceholderText("Поиск по названию, платформе, пути или ссылке…")
+        self.history_search.textChanged.connect(self._refresh_history)
+        refresh_button = QPushButton("Обновить")
+        refresh_button.clicked.connect(self._refresh_history)
+        controls.addWidget(self.history_search, 1)
+        controls.addWidget(refresh_button)
+        layout.addLayout(controls)
+
+        self.history_table = QTableWidget(0, 5)
+        self.history_table.setHorizontalHeaderLabels(["Дата загрузки", "Платформа", "Название", "Файл", "Размер"])
+        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history_table.setAlternatingRowColors(False)
+        self.history_table.doubleClicked.connect(self._open_history_file)
+        layout.addWidget(self.history_table, 1)
+
+        buttons = QHBoxLayout()
+        open_button = QPushButton("Открыть файл")
+        open_button.clicked.connect(self._open_history_file)
+        remove_button = QPushButton("Убрать запись")
+        remove_button.clicked.connect(self._delete_history_record)
+        self.history_summary = QLabel("Файлов: 0")
+        self.history_summary.setStyleSheet("color: #9ba3b5;")
+        buttons.addWidget(self.history_summary)
+        buttons.addStretch()
+        buttons.addWidget(open_button)
+        buttons.addWidget(remove_button)
+        layout.addLayout(buttons)
+        self._refresh_history()
+
+    @staticmethod
+    def _format_file_size(size):
+        value = float(size or 0)
+        for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+            if value < 1024 or unit == "ТБ":
+                return f"{value:.1f} {unit}" if unit != "Б" else f"{int(value)} Б"
+            value /= 1024
+
+    def _refresh_history(self, *_):
+        if not hasattr(self, "history_table"):
+            return
+        rows = self.history.list_files(self.history_search.text() if hasattr(self, "history_search") else "")
+        self.history_table.setRowCount(0)
+        for record in rows:
+            row = self.history_table.rowCount()
+            self.history_table.insertRow(row)
+            date_text = record["downloaded_at"].replace("T", " ")
+            values = [date_text, record["platform"], record["title"], record["file_path"], self._format_file_size(record["file_size"])]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(record["file_path"]))
+                self.history_table.setItem(row, col, item)
+            self.history_table.item(row, 0).setData(Qt.UserRole, record["id"])
+            self.history_table.item(row, 3).setData(Qt.UserRole, record["file_path"])
+        self.history_summary.setText(f"Файлов: {len(rows)}")
+
+    def _selected_history_record(self):
+        row = self.history_table.currentRow()
+        if row < 0:
+            return None
+        return self.history_table.item(row, 0).data(Qt.UserRole), self.history_table.item(row, 3).data(Qt.UserRole)
+
+    def _open_history_file(self, *_):
+        selected = self._selected_history_record()
+        if not selected:
+            QMessageBox.information(self, "История", "Сначала выберите запись.")
+            return
+        path = Path(selected[1])
+        if not path.exists():
+            QMessageBox.warning(self, "Файл не найден", f"Файл больше не существует по указанному пути:\n{path}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _delete_history_record(self):
+        selected = self._selected_history_record()
+        if not selected:
+            QMessageBox.information(self, "История", "Сначала выберите запись.")
+            return
+        self.history.delete_record(selected[0])
+        self._refresh_history()
+
+    def on_downloaded_files(self, task_id, file_paths):
+        row = self.task_rows.get(task_id)
+        if row is None or row >= self.table.rowCount():
+            return
+        url = self.table.item(row, 1).text()
+        platform = detect_platform(url) or "unknown"
+        platform_name = {"youtube": "YouTube", "instagram": "Instagram"}.get(platform, platform)
+        title = self.task_titles.get(task_id, "")
+        self.history.add_files(task_id, platform_name, title, url, file_paths)
+        self._refresh_history()
+        self._append_log("SUCCESS", f"В историю SQLite добавлено файлов: {len(file_paths)}", task_id=task_id)
 
     def _build_logs_tab(self):
         layout = QVBoxLayout(self.logs_tab)
@@ -512,6 +623,7 @@ class MainWindow(QMainWindow):
             worker.progress.connect(self.on_progress)
             worker.title_changed.connect(self.on_title_changed)
             worker.finished_task.connect(self.on_finished)
+            worker.downloaded_files.connect(self.on_downloaded_files)
             worker.log_event.connect(self.on_log_event)
             worker.finished.connect(lambda tid=task_id: self._cleanup_worker(tid))
             self.workers[task_id] = worker
