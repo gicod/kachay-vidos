@@ -52,10 +52,11 @@ class MainWindow(QMainWindow):
         self.task_titles = {}
         self.task_playlist_folders = {}
         self.task_rows = {}
+        self.task_speeds = {}
         self.log_entries = []
         self.history = DownloadHistory()
         self.queue_paused = False
-        self.setWindowTitle("Video Downloader")
+        self.setWindowTitle("kachay-vidos")
         self.resize(1050, 720)
         self.setMinimumSize(820, 600)
         self.setStyleSheet(APP_STYLE)
@@ -72,18 +73,34 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         title_col = QVBoxLayout()
-        title = QLabel("⬇  Video Downloader")
+        title = QLabel("kachay-vidos")
         title.setStyleSheet("font-size: 24px; font-weight: 700;")
-        subtitle = QLabel("YouTube  ·  Instagram")
-        subtitle.setObjectName("subtitle")
         title_col.addWidget(title)
-        title_col.addWidget(subtitle)
         header.addLayout(title_col)
         header.addStretch()
-        self.theme_label = QLabel("● Тёмная тема")
-        self.theme_label.setStyleSheet("color: #aab6ff; font-weight: 600;")
-        header.addWidget(self.theme_label)
         layout.addLayout(header)
+
+        # Compact live status panel at the top of the application.
+        self.activity_dot = QLabel("●")
+        self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 18px;")
+        self.activity_label = QLabel("Нет активных загрузок")
+        self.activity_label.setStyleSheet("font-weight: 600; color: #b8c0d0;")
+        self.speed_label = QLabel("Скорость: 0 Б/с")
+        self.speed_label.setStyleSheet("color: #9ba3b5;")
+        self.active_count_label = QLabel("Активно: 0")
+        self.active_count_label.setStyleSheet("color: #9ba3b5;")
+        status_panel = QHBoxLayout()
+        status_panel.setContentsMargins(10, 7, 10, 7)
+        status_panel.addWidget(self.activity_dot)
+        status_panel.addWidget(self.activity_label)
+        status_panel.addSpacing(18)
+        status_panel.addWidget(self.speed_label)
+        status_panel.addStretch()
+        status_panel.addWidget(self.active_count_label)
+        self.top_status_panel = QWidget()
+        self.top_status_panel.setLayout(status_panel)
+        self.top_status_panel.setStyleSheet("QWidget { background: #22252e; border: 1px solid #343947; border-radius: 7px; }")
+        layout.addWidget(self.top_status_panel)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
@@ -91,14 +108,17 @@ class MainWindow(QMainWindow):
         self.settings_tab = QWidget()
         self.logs_tab = QWidget()
         self.history_tab = QWidget()
+        self.changelog_tab = QWidget()
         self.tabs.addTab(self.download_tab, "Загрузки")
         self.tabs.addTab(self.history_tab, "История")
         self.tabs.addTab(self.settings_tab, "Настройки")
         self.tabs.addTab(self.logs_tab, "Логи")
+        self.tabs.addTab(self.changelog_tab, "Change log")
         self._build_download_tab()
         self._build_settings_tab()
         self._build_logs_tab()
         self._build_history_tab()
+        self._build_changelog_tab()
         self.setStatusBar(QStatusBar())
 
     def _build_download_tab(self):
@@ -194,6 +214,32 @@ class MainWindow(QMainWindow):
         buttons.addWidget(remove_button)
         layout.addLayout(buttons)
         self._refresh_history()
+
+    def _build_changelog_tab(self):
+        layout = QVBoxLayout(self.changelog_tab)
+        layout.setContentsMargins(8, 12, 8, 8)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("История изменений приложения из файла CHANGELOG.md"))
+        self.changelog_view = QTextEdit()
+        self.changelog_view.setReadOnly(True)
+        self.changelog_view.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.changelog_view.setStyleSheet("font-size: 13px; padding: 10px;")
+        changelog_path = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+        try:
+            content = changelog_path.read_text(encoding="utf-8")
+        except OSError:
+            content = "Файл CHANGELOG.md не найден."
+        self.changelog_view.setPlainText(content)
+        layout.addWidget(self.changelog_view, 1)
+        refresh = QPushButton("Обновить историю изменений")
+        refresh.clicked.connect(lambda: self._reload_changelog(changelog_path))
+        layout.addWidget(refresh)
+
+    def _reload_changelog(self, path):
+        try:
+            self.changelog_view.setPlainText(path.read_text(encoding="utf-8"))
+        except OSError:
+            self.changelog_view.setPlainText("Файл CHANGELOG.md не найден.")
 
     @staticmethod
     def _format_file_size(size):
@@ -491,8 +537,7 @@ class MainWindow(QMainWindow):
 
     def _update_theme_label(self):
         theme = self.settings.get("theme", "dark")
-        labels = {"dark": "● Тёмная тема", "light": "● Светлая тема", "system": "● Тема системы"}
-        self.theme_label.setText(labels.get(theme, "● Тёмная тема"))
+        # Theme is applied silently; theme label was removed from the interface.
 
     def add_urls(self):
         urls = parse_urls(self.url_input.toPlainText())
@@ -629,6 +674,7 @@ class MainWindow(QMainWindow):
             self.workers[task_id] = worker
             self.table.item(row, 2).setText("Загрузка")
             self.table.item(row, 4).setText(self.task_titles.get(task_id, "Получение названия видео…"))
+            self.task_speeds[task_id] = "0 Б/с"
             worker.start()
             active_platforms.add(platform)
         self._update_summary()
@@ -655,6 +701,8 @@ class MainWindow(QMainWindow):
         if row is None or row >= self.table.rowCount():
             return
         self.table.item(row, 3).setText(f"{percent}%")
+        self.task_speeds[task_id] = speed or "0 Б/с"
+        self._update_activity_status()
         title = self.task_titles.get(task_id, "")
         # Keep the video title on the first line; progress details go below it.
         details = speed or "Загрузка…"
@@ -667,6 +715,7 @@ class MainWindow(QMainWindow):
         if row is None or row >= self.table.rowCount():
             return
         cancelled = (not success) and message.lower().startswith("отменено")
+        self.task_speeds.pop(task_id, None)
         self.table.item(row, 2).setText("Готово" if success else ("Отменено" if cancelled else "Ошибка"))
         if success:
             self.table.item(row, 3).setText("100%")
@@ -678,12 +727,15 @@ class MainWindow(QMainWindow):
         log_level = "SUCCESS" if success else ("WARNING" if cancelled else "ERROR")
         self._append_log(log_level, message, task_id=task_id)
         self._update_summary()
+        self._update_activity_status()
 
     def _cleanup_worker(self, task_id):
         worker = self.workers.pop(task_id, None)
         if worker:
             worker.deleteLater()
+        self.task_speeds.pop(task_id, None)
         self._update_summary()
+        self._update_activity_status()
         # Start the next waiting task automatically after the thread has stopped.
         # Failed tasks are not retried automatically, avoiding an endless retry loop.
         QTimer.singleShot(0, lambda: self.start_queue(retry_errors=False))
@@ -759,6 +811,24 @@ class MainWindow(QMainWindow):
             self.task_rows[task_id] = row
         self._update_summary()
 
+    def _update_activity_status(self):
+        active_ids = [tid for tid, worker in self.workers.items() if worker.isRunning()]
+        active_ids += [tid for tid, resolver in self.resolvers.items() if resolver.isRunning()]
+        active_count = len(set(active_ids))
+        if active_count:
+            self.activity_dot.setStyleSheet("color: #36c979; font-size: 18px;")
+            self.activity_label.setText("Идёт загрузка")
+            self.activity_label.setStyleSheet("font-weight: 600; color: #36c979;")
+            speeds = [value for tid, value in self.task_speeds.items() if tid in active_ids and value]
+            speed_text = ", ".join(speeds) if speeds else "ожидание скорости…"
+            self.speed_label.setText(f"Скорость: {speed_text}")
+        else:
+            self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 18px;")
+            self.activity_label.setText("Нет активных загрузок")
+            self.activity_label.setStyleSheet("font-weight: 600; color: #b8c0d0;")
+            self.speed_label.setText("Скорость: 0 Б/с")
+        self.active_count_label.setText(f"Активно: {active_count}")
+
     def _update_summary(self):
         counts = {}
         for row in range(self.table.rowCount()):
@@ -769,6 +839,8 @@ class MainWindow(QMainWindow):
             f"Загружается: {counts.get('Загрузка', 0) + counts.get('Разбор плейлиста', 0) + counts.get('Отмена…', 0)} · "
             f"Ошибок: {counts.get('Ошибка', 0)} · Отменено: {counts.get('Отменено', 0)}"
         )
+        if hasattr(self, "activity_dot"):
+            self._update_activity_status()
 
     def closeEvent(self, event):
         running = [worker for worker in self.workers.values() if worker.isRunning()]

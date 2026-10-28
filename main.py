@@ -4,7 +4,7 @@ from ui.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Video Downloader")
+    app.setApplicationName("kachay-vidos")
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
