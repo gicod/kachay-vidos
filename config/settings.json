@@ -1,7 +1,7 @@
 {
     "theme": "dark",
     "download_paths": {
-        "youtube": "C:/02_Dev/py/video",
+        "youtube": "C:/02_Dev/py/video/test",
         "instagram": "C:/02_Dev/py/video/test"
     },
     "quality": {

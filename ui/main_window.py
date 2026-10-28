@@ -80,27 +80,27 @@ class MainWindow(QMainWindow):
         header.addWidget(title, 0, Qt.AlignVCenter)
         header.addStretch(1)
 
-        self.activity_dot = QLabel("●")
-        self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 15px;")
         self.activity_label = QLabel("Готово")
-        self.activity_label.setStyleSheet("font-weight: 600; color: #b8c0d0;")
-        self.overall_progress_label = QLabel("0/0 файлов")
+        self.activity_label.setStyleSheet("font-weight: 600; color: #9ba3b5;")
+        self.overall_progress_label = QLabel("000/000")
         self.overall_progress_label.setStyleSheet("color: #9ba3b5;")
         self.speed_label = QLabel("0 Б/с")
         self.speed_label.setStyleSheet("color: #9ba3b5;")
-        self.active_count_label = QLabel("Очередь: 0")
-        self.active_count_label.setStyleSheet("color: #9ba3b5;")
+        # Fixed widths prevent the header from jumping as labels change.
+        metrics = self.fontMetrics()
+        self.activity_label.setFixedWidth(metrics.horizontalAdvance("Загрузка") + 8)
+        self.overall_progress_label.setFixedWidth(metrics.horizontalAdvance("000/000") + 8)
+        self.speed_label.setFixedWidth(metrics.horizontalAdvance("999.9 МБ/с") + 8)
+        for status_label in (self.activity_label, self.overall_progress_label, self.speed_label):
+            status_label.setMinimumHeight(metrics.height())
         status_panel = QHBoxLayout()
         status_panel.setContentsMargins(10, 6, 10, 6)
         status_panel.setSpacing(10)
-        status_panel.addWidget(self.activity_dot)
         status_panel.addWidget(self.activity_label)
         status_panel.addWidget(self._make_status_separator())
         status_panel.addWidget(self.overall_progress_label)
         status_panel.addWidget(self._make_status_separator())
         status_panel.addWidget(self.speed_label)
-        status_panel.addWidget(self._make_status_separator())
-        status_panel.addWidget(self.active_count_label)
         self.top_status_panel = QWidget()
         self.top_status_panel.setLayout(status_panel)
         self.top_status_panel.setStyleSheet("QWidget { background: #22252e; border: 1px solid #343947; border-radius: 7px; }")
@@ -843,6 +843,27 @@ class MainWindow(QMainWindow):
             self.task_rows[task_id] = row
         self._update_summary()
 
+    @staticmethod
+    def _speed_to_bytes(value):
+        """Convert yt-dlp speed text to bytes/second for a combined total."""
+        import re
+        match = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*([KMGT]?i?B)/s", str(value or ""), re.I)
+        if not match:
+            return 0.0
+        amount = float(match.group(1).replace(",", "."))
+        unit = match.group(2).upper()
+        prefix = unit[0] if unit and unit[0] in "KMGT" else ""
+        power = "1024" if "I" in unit else "1000"
+        return amount * (float(power) ** ("KMGT".find(prefix) + 1) if prefix else 1)
+
+    @staticmethod
+    def _format_speed(bytes_per_second):
+        value = max(0.0, float(bytes_per_second or 0))
+        for unit in ("Б/с", "КБ/с", "МБ/с", "ГБ/с"):
+            if value < 1000 or unit == "ГБ/с":
+                return f"{value:.1f} {unit}" if unit != "Б/с" else f"{int(value)} Б/с"
+            value /= 1000
+
     def _update_activity_status(self):
         active_ids = [tid for tid, worker in self.workers.items() if worker.isRunning()]
         active_ids += [tid for tid, resolver in self.resolvers.items() if resolver.isRunning()]
@@ -850,15 +871,12 @@ class MainWindow(QMainWindow):
         active_count = len(active_ids)
         total_tasks = self.table.rowCount() if hasattr(self, "table") else 0
         completed = 0
-        queued = 0
         progress_values = []
         for row in range(total_tasks):
             status_item = self.table.item(row, 2)
             progress_item = self.table.item(row, 3)
             if status_item and status_item.text() == "Готово":
                 completed += 1
-            elif status_item and status_item.text() == "В очереди":
-                queued += 1
             if progress_item:
                 try:
                     progress_values.append(max(0, min(100, int(progress_item.text().replace("%", "")))))
@@ -866,19 +884,16 @@ class MainWindow(QMainWindow):
                     progress_values.append(0)
         overall = int(sum(progress_values) / len(progress_values)) if progress_values else 0
         if active_count:
-            self.activity_dot.setStyleSheet("color: #36c979; font-size: 15px;")
             self.activity_label.setText("Загрузка")
             self.activity_label.setStyleSheet("font-weight: 600; color: #36c979;")
-            speeds = [value for tid, value in self.task_speeds.items() if tid in active_ids and value]
-            speed_text = " + ".join(speeds) if speeds else "ожидание скорости"
-            self.speed_label.setText(speed_text)
+            speeds = [self._speed_to_bytes(value) for tid, value in self.task_speeds.items() if tid in active_ids]
+            self.speed_label.setText(self._format_speed(sum(speeds)))
         else:
-            self.activity_dot.setStyleSheet("color: #8b93a5; font-size: 15px;")
             self.activity_label.setText("Готово")
-            self.activity_label.setStyleSheet("font-weight: 600; color: #b8c0d0;")
+            self.activity_label.setStyleSheet("font-weight: 600; color: #9ba3b5;")
             self.speed_label.setText("0 Б/с")
-        self.overall_progress_label.setText(f"{completed}/{total_tasks} готово · {overall}%")
-        self.active_count_label.setText(f"Очередь: {queued} · Активно: {active_count}")
+        # Only completed/total remains; leading zeroes keep its width stable.
+        self.overall_progress_label.setText(f"{completed:03d}/{total_tasks:03d}")
 
     def _update_summary(self):
         counts = {}
